@@ -15,6 +15,7 @@ import org.apache.http.client.utils.*
 import org.apache.http.concurrent.*
 import org.apache.http.entity.*
 import org.apache.http.impl.nio.client.*
+import org.apache.http.util.*
 import java.io.*
 import java.lang.*
 import java.util.*
@@ -31,18 +32,7 @@ class ApacheBackend(sslContext: SSLContext?) : HttpClientBackend {
 
         val sendTime = Date()
         val apacheResponse = suspendCoroutine<HttpResponse> { continuation ->
-            backend.execute(apacheRequest, object : FutureCallback<HttpResponse> {
-                override fun completed(result: HttpResponse) {
-                    continuation.resume(result)
-                }
-
-                override fun cancelled() {
-                }
-
-                override fun failed(exception: Exception) {
-                    continuation.resumeWithException(exception)
-                }
-            })
+            backend.execute(apacheRequest, SuspendFutureCallback(continuation))
         }
         val receiveTime = Date()
 
@@ -95,16 +85,14 @@ class ApacheBackend(sslContext: SSLContext?) : HttpClientBackend {
             values.forEach { value -> builder.addHeader(name, value) }
         }
 
-        val body = request.body
-        when (body) {
-            is InputStreamBody -> InputStreamEntity(body.stream)
-            is OutputStreamBody -> {
-                val stream = ByteArrayOutputStream()
-                body.block(stream)
-                ByteArrayEntity(stream.toByteArray())
-            }
-            else -> null
-        }?.let { builder.entity = it }
+        val body = request.body as HttpMessageBody
+        val length = request.contentLength() ?: -1
+        val chunked = request.headers[HttpHeaders.TransferEncoding] == "chunked"
+
+        if (body !is EmptyBody) {
+            val bodyStream = body.toByteReadChannel().toInputStream()
+            builder.entity = InputStreamEntity(bodyStream, length.toLong()).apply { isChunked = chunked }
+        }
 
         builder.config = RequestConfig.custom()
                 .setRedirectsEnabled(request.followRedirects)
@@ -139,12 +127,24 @@ class ApacheBackend(sslContext: SSLContext?) : HttpClientBackend {
             }
 
             body = if (entity?.isStreaming == true) {
-                val stream = entity.content
-                origin = Closeable { stream.close() }
-                InputStreamBody(stream)
+                val bytes = EntityUtils.toByteArray(entity)
+                ByteReadChannelBody(bytes.toByteReadChannel())
             } else EmptyBody
         }
 
         return builder
+    }
+}
+
+private class SuspendFutureCallback(private val continuation: Continuation<HttpResponse>) : FutureCallback<HttpResponse> {
+    override fun completed(result: HttpResponse) {
+        continuation.resume(result)
+    }
+
+    override fun cancelled() {
+    }
+
+    override fun failed(exception: Exception) {
+        continuation.resumeWithException(exception)
     }
 }
